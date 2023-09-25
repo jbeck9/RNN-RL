@@ -7,8 +7,12 @@ import copy
 
 import datamanager
 import strats
+import math
+
+NLL_CONST= math.log(math.sqrt(2 * math.pi))
 
 cat= torch.cat
+
 
 def get_device(x):
     device= x.get_device()
@@ -68,6 +72,7 @@ def vargmax(x, valid):
         ind= torch.Tensor(range(x.shape[-1]))[m][x[n][m].argmax()].long()
         
         out[n, ind] = 1
+        
     return out
 
 def qpack(x, o, T):
@@ -117,6 +122,38 @@ def doubleq(cls):
             self.target.load_state_dict(target_net_state_dict)
         
     return DoubleQ
+
+class ProbLinear(nn.Module):
+    def __init__(self, input_size, nhidden, output_size, epsilon= 0.05):
+        super(ProbLinear, self).__init__()
+        
+        self.out_size= output_size
+        self.epsilon= epsilon
+        
+        # net= [nn.Linear(input_size, nhidden), nn.ReLU()]
+        # for _ in range(1):
+        #     net.extend([nn.Linear(nhidden, nhidden), nn.ReLU()])
+        # self.lin1= nn.Sequential(*net)
+        
+        net= [nn.Linear(input_size, nhidden), nn.ReLU()]
+        for _ in range(1):
+            net.extend([nn.Linear(nhidden, nhidden), nn.ReLU()])
+        net.extend([nn.Linear(nhidden, output_size)])
+        self.lin_mean= nn.Sequential(*net)
+        
+        net= [nn.Linear(input_size, nhidden), nn.ReLU()]
+        for _ in range(1):
+            net.extend([nn.Linear(nhidden, nhidden), nn.ReLU()])
+        net.extend([nn.Linear(nhidden, output_size), nn.Softplus()])
+        self.lin_var= nn.Sequential(*net)
+        
+    def forward(self, x):
+        # out= self.lin1(x)
+        
+        mean= self.lin_mean(x).unsqueeze(1)
+        var= self.lin_var(x).unsqueeze(1) + self.epsilon
+        
+        return cat([mean, var], dim=1).view(x.shape[0], self.out_size * 2)
 
 
 class TEncoder(nn.Module):
@@ -175,12 +212,14 @@ class RnnQnet(nn.Module):
         self.attn_combine= nn.Sequential(nn.Linear(self.input_size + self.nclasses + enc_size, nhidden),
                                          nn.ReLU())
         
-        net= []
-        for _ in range(lin_layers):
-            net.extend([nn.Linear(nhidden, nhidden), nn.ReLU()])
-        net.extend([nn.Linear(nhidden, nclasses)])
+        # net= []
+        # for _ in range(lin_layers):
+        #     net.extend([nn.Linear(nhidden, nhidden), nn.ReLU()])
+        # net.extend([nn.Linear(nhidden, nclasses)])
         
-        self.out_linear= nn.Sequential(*net)
+        # self.out_linear= nn.Sequential(*net)
+        
+        self.out_linear= ProbLinear(nhidden, nhidden, nclasses)
     
     def reset_hidden(self):
         self.hidden= None
@@ -210,7 +249,7 @@ class RnnQnet(nn.Module):
         terminate= get_terminate(T_in, self.seqlen).unsqueeze(-1)
         bs= x.shape[0]
         
-        Qs= self.padval * torch.ones([bs, self.seqlen, self.nclasses])
+        Qs= self.padval * torch.ones([bs, self.seqlen, self.nclasses * 2])
         Qn= self.padval * torch.ones([bs, self.seqlen, self.nclasses])
         
         z= self.enc(x, torch.ones_like(pad_mask).bool())
@@ -234,7 +273,7 @@ class RnnQnet(nn.Module):
             self.update_hidden(i, z, mask)
             q= input_padded(self.hidden[-1], self.out_linear, mask)
             
-            Qn[:,n] = q
+            Qn[:,n] = q.view(bs, 2, -1)[:,0]
             Qs[:, n+1] = q
         
         return Qs, Qn, terminate, pad_mask
@@ -279,8 +318,11 @@ class RnnQnet(nn.Module):
             
             # print(explore_mask)
             with torch.no_grad():
-                act_out= vargmax(self.out_linear(self.hidden[-1][mask][~explore_mask]), total_permit[mask][~explore_mask])
-                # print(act_out)
+                pred_out= self.out_linear(self.hidden[-1][mask][~explore_mask]).view(-1, 2, action.shape[-1])
+                pred= pred_out[:,0]
+                pred_var= pred_out[:,1]
+                print(pred_var)
+                act_out= vargmax(pred, total_permit[mask][~explore_mask])
                 sub_action[~explore_mask] = act_out
             
             sub_action[explore_mask] = explore_choice
@@ -289,24 +331,23 @@ class RnnQnet(nn.Module):
             
             reward= self.padval * torch.ones([bs])
             terminate= torch.zeros([bs]).bool()
-            reward_out, terminate_out= r_fn(action[mask], history[:,:n+1][mask], x[:,n][mask], y[:,n][mask])
+            reward_out, terminate_out= r_fn(action[mask], history[:,:n+1][mask], x[:,:n+1][mask], y[:,:n+1][mask])
             
             reward[mask]= reward_out
             terminate[mask] = terminate_out
             
-            T_out[terminate] = n + 1
+            T_out[terminate] = n+1
             
-            mask= T_out > n+2
+            mask= T_out > n+1
             rf_out[:,n] = cat([action.to(device),reward.unsqueeze(1).to(device)], dim=-1)
             
             # print(reward[0])
             # input()
             
             if torch.all(~mask):
-                # print(T_out)
                 return rf_out.detach(), T_out
             else:
-                history[:, n+1] = action
+                history[:, n] = action
                 i= torch.cat([x[:,n + 1], action.to(device)], dim=-1)
                 with torch.no_grad():
                     self.update_hidden(i, z, mask)
@@ -318,13 +359,22 @@ def qLoss(out, lf, gamma= 0.98):
     reward= out[3]
     not_terminal= out[4]
     
-    q_sel= torch.gather(q_state, -1, torch.argmax(action, dim=-1).unsqueeze(1))
+    q_state= q_state.view(q_state.shape[0], 2, -1)
+    
+    action_amax= torch.argmax(action, dim=-1).unsqueeze(1)
+    q_sel_m= torch.gather(q_state[:,0], -1, action_amax)
+    q_sel_v= torch.gather(q_state[:,1], -1, action_amax)
+    
+    # q_sel= torch.distributions.Normal(q_sel_m, 0.05 + torch.sqrt(q_sel_v))
     
     next_q_sel= next_q.max(dim=-1)[0].unsqueeze(1).detach()
     
     target= reward + (gamma * next_q_sel * not_terminal)
     
-    return lf(q_sel, target)
+    l= ((q_sel_m - target) ** 2) / (2 * q_sel_v) + torch.log(q_sel_v)# + NLL_CONST
+    
+    return l.mean()
+    # return lf(q_sel.loc, target)
 
 if __name__ == '__main__':
     n_classes= 6
@@ -332,28 +382,25 @@ if __name__ == '__main__':
     nhidden= 256
     batch_size= 128
     
-    lf= nn.HuberLoss()
-    buffer= datamanager.ReplayMemory(1280)
+    # lf= nn.HuberLoss()
+    lf= nn.MSELoss()
+    buffer= datamanager.ReplayMemory(batch_size * 10)
     
     T= seq_len * torch.ones([batch_size]).long()
     in_cat= [n_classes, 1, 1, 1]
     
-    loss_cat= [n_classes, n_classes, n_classes, 1, 1]
+    loss_cat= [n_classes*2, n_classes, n_classes, 1, 1]
     
-    model= RnnQnet(n_classes, nhidden, seq_len, nhidden, 2, in_cat= in_cat).cuda()
+    model= RnnQnet(n_classes, nhidden, seq_len, nhidden, 1, in_cat= in_cat).cuda()
     
-    explorer= strats.Explorer(n_classes, 0.9)
+    explorer= strats.Explorer(n_classes, (0.05, 0.9), 0.999)
     rewarder= strats.Rewarder(batch_size, model.policy.in_cat)
     
-    model_op= optim.Adam(model.policy.parameters(), lr=0.0001)
+    model_op= optim.Adam(model.policy.parameters(), lr=0.0002)
     
     try:
-        for _ in range(10000):
+        for _ in range(3000):
             model_op.zero_grad()
-            explorer.epsilon*= 0.999
-            
-            if explorer.epsilon < 0.05:
-                explorer.epsilon = 0.05
             
             x,fpts= datamanager.data_gen(batch_size= batch_size, inst_size= seq_len, class_size= n_classes)
             infout, T_out= model.policy.inf(x,fpts,rewarder.reward, explorer.explore, T, all_valid_actions= x[:,:,:n_classes])
@@ -371,7 +418,9 @@ if __name__ == '__main__':
             print(float(loss))
             loss.backward()
             
+            # torch.nn.utils.clip_grad_norm_(model.policy.parameters(), 0.5)
             model_op.step()
+            explorer.step()
             rewarder.reset()
             
             model.target_copy()
