@@ -2,6 +2,21 @@ import torch
 import random
 from collections import deque
 
+import numpy as np
+
+def decat(out, cat_order, device= 'cpu'):
+    assert sum(cat_order) == out.shape[-1], "Cat orders don't match"
+    
+    og_shape= list(out.shape[:-1])
+    tot_out= []
+    tot= 0
+    flatout= out.flatten(0, -2)
+    for i in cat_order:
+        tot_out.append(flatout[:,tot:i+tot].view(og_shape + [-1]).to(device))
+        tot += i
+
+    return tot_out
+
 class ReplayBuffer():
     def __init__(self, max_size=50, cat_order= None):
         assert (max_size > 0), 'Empty buffer or trying to create a black hole. Be careful.'
@@ -69,7 +84,7 @@ def data_gen(batch_size=64, inst_size= 100, class_size= 5):
     cl= (cl > 0.5).float()
     cl[:,:,-1] = 1.
     
-    sal= (torch.rand([batch_size, inst_size, 1]) + 0.1) * 0.5
+    sal= (torch.rand([batch_size, inst_size, 1]) + 0.1) * 0.4
     
     proj= torch.rand([batch_size, inst_size, 1])
     
@@ -83,3 +98,31 @@ def data_gen(batch_size=64, inst_size= 100, class_size= 5):
     x= torch.cat([cl, indicator, sal, proj], dim=-1), fpts
     
     return x
+
+
+def sample_eval(x, sal, rew, nsamples= 30000):
+    inds= np.array(list(range(len(x))))
+    n_space= x.shape[-1]
+    
+    ind= 0.1 * np.ones([nsamples, n_space])
+    for ci in range(n_space):
+        mask= x[:,ci].bool().numpy()
+        ind[:, ci] = np.random.choice(inds[mask], [nsamples])
+    
+    ind= np.unique(np.sort(ind, axis=1), axis=0)
+    ind= ind[np.array([len(np.unique(b)) == n_space for b in ind]).astype(bool)]
+    
+    ind= ind[sal[ind].sum(dim=1)[:,0] < 1]
+    return rew[ind].sum(dim=1)[:,0].max()
+    
+    
+    
+    # x_choices= x[ind]
+    # valid_mask_1= np.array([np.diag(b) for b in x_choices])
+    
+if __name__ == "__main__":
+    in_cat= [6, 1, 1, 1]
+    x,y= data_gen(batch_size= 1, inst_size= 30, class_size= 6)
+    x, last, sal, proj= decat(x, in_cat)
+    
+    sample_eval(x[0,:,:-1], sal[0], y[0])

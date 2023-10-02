@@ -24,7 +24,7 @@ class Explorer():
         self.out_size= out_size
         
         self.weights= torch.ones([out_size])
-        self.weights[-1] = 1
+        self.weights[-1] = 5
         
     def step(self):
         self.epsilon*= self.decay_rate
@@ -64,16 +64,9 @@ class Explorer():
 class Rewarder():
     def __init__(self, batch_size, decat):
         self.decat= decat
-        self.batch_size= batch_size
-        
-        self.reset()
-        
-    def reset(self):
-        self.r_cum= torch.zeros([self.batch_size])
-        self.c_cum= torch.zeros([self.batch_size])
     
-    def rew_strat_1(self, action_hist, valid, last):
-        r= -0.2
+    def rew_strat_1(self, action_hist, valid, last, reward, sal):
+        r= 0.01
         terminate= False
         
         stack_sum= action_hist.sum(dim=0)[:-1]
@@ -83,21 +76,24 @@ class Rewarder():
         if (action * valid).sum(dim=-1) < 0.5:
             r = -1
             terminate= True
-            return torch.Tensor([r]), torch.Tensor([terminate])
         
         #Multiple selections of same class
-        if torch.any(stack_sum> 1.5):
+        elif torch.any(stack_sum> 1.5):
             r = -1
             terminate = True
-            return torch.Tensor([r]), torch.Tensor([terminate])
+            
+        elif sal.sum() > 1:
+            r= -1
+            terminate= True
         
         
-        if action[:-1].sum() == 1:
+        elif action[:-1].sum() == 1:
             terminate= False
-            r = 1
+            r = 0.4*reward[-1]
             if torch.all(stack_sum == 1):
-                r= 5
                 terminate= True
+                r= 0.02*(reward.sum()**4)
+                # print(float(r))
         
         if not terminate and last:
             terminate = True
@@ -110,15 +106,18 @@ class Rewarder():
         action_hist[:,-1] = action
         valid_actions, last, salaries, proj= decat(x, self.decat)
         
+        sel_ind= action_hist[:,:,:-1].bool().any(dim=-1)
+        
         # print(valid_actions)
         
         r_out= []
         t_out= []
         for n in range(len(action)):
-            # if action[n, :-1].any():
-            #     self.r_cum[n] += fpts[n,0]
-            #     self.c_cum[n] += salaries[n,0]
-            r, t= self.rew_strat_1(action_hist[n], valid_actions[n,-1], last[n, -1])
+            # sel_ind= action_hist[:-1]
+            
+            sel_r= fpts[n, sel_ind[n]]
+            sel_sal= salaries[n, sel_ind[n]]
+            r, t= self.rew_strat_1(action_hist[n], valid_actions[n,-1], last[n, -1], sel_r, sel_sal)
             r_out.append(r)
             t_out.append(t)
             
