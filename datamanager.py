@@ -77,12 +77,8 @@ def norm(x, a=0, b=1):
 
 def data_gen(batch_size=64, inst_size= 100, class_size= 5):
     
-    indicator= torch.zeros([batch_size, inst_size, 1])
-    indicator[:,-1,:] = 1
-    
     cl= torch.rand([batch_size, inst_size, class_size])
     cl= (cl > 0.5).float()
-    cl[:,:,-1] = 1.
     
     sal= (torch.rand([batch_size, inst_size, 1]) + 0.1) * 0.4
     
@@ -95,7 +91,7 @@ def data_gen(batch_size=64, inst_size= 100, class_size= 5):
     
     # print(float(torch.corrcoef(torch.cat([fpts, proj], dim=-1).flatten(0,1).T)[1,0]))
     
-    x= torch.cat([cl, indicator, sal, proj], dim=-1), fpts
+    x= torch.cat([cl, sal, fpts], dim=-1), fpts
     
     return x
 
