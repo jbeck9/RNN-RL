@@ -91,7 +91,7 @@ def data_gen(batch_size=64, inst_size= 100, class_size= 5):
     
     # print(float(torch.corrcoef(torch.cat([fpts, proj], dim=-1).flatten(0,1).T)[1,0]))
     
-    x= torch.cat([cl, sal, fpts], dim=-1), fpts
+    x= torch.cat([cl, sal, proj], dim=-1), fpts
     
     return x
 

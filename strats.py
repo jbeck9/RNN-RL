@@ -46,20 +46,26 @@ class Explorer():
 class Rewarder():
     def __init__(self, batch_size, decat):
         self.decat= decat
+        self.NORM= float(3**5)
     
     def reward(self, action, x, y):
         
-        out= torch.zeros_like(action).float()
+        r= torch.zeros_like(action).float()
         
         valid_actions, salaries, proj= decat(x, self.decat)
         
-        sal_sel= salaries[action]
-        r_sel= y[action]
+        sal_sel= salaries[action].squeeze(-1)
+        r_sel= y[action].squeeze(-1)
         
-        if sal_sel.sum() < 1:
-            r= r_sel.sum()
+        sal_tot= torch.zeros(sal_sel.shape)
+        for n in range(sal_sel.shape[1]):
+            sal_tot[:,n] = sal_sel[:,:n+1].sum(dim=-1)
+        
+        sal_good= (sal_tot < 1)
+        sal_bad= (~sal_good)
+        if sal_bad.any():
+            r[:,-1]= -5
         else:
-            r= -2
+            r[:,-1] += 2*(r_sel.sum(dim=1)**5 / self.NORM)
         
-        out[-1] = r
-        return out
+        return r

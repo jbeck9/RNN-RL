@@ -9,7 +9,8 @@ import datamanager
 import strats
 import math
 
-NLL_CONST= math.log(math.sqrt(2 * math.pi))
+import numpy as np
+import mdn
 
 cat= torch.cat
 
@@ -112,38 +113,6 @@ def doubleq(cls):
         
     return DoubleQ
 
-class ProbLinear(nn.Module):
-    def __init__(self, input_size, nhidden, output_size, epsilon= 0.01):
-        super(ProbLinear, self).__init__()
-        
-        self.out_size= output_size
-        self.epsilon= epsilon
-        
-        # net= [nn.Linear(input_size, nhidden), nn.ReLU()]
-        # for _ in range(1):
-        #     net.extend([nn.Linear(nhidden, nhidden), nn.ReLU()])
-        # self.lin1= nn.Sequential(*net)
-        
-        net= [nn.Linear(input_size, nhidden), nn.ReLU()]
-        for _ in range(1):
-            net.extend([nn.Linear(nhidden, nhidden), nn.ReLU()])
-        net.extend([nn.Linear(nhidden, output_size)])
-        self.lin_mean= nn.Sequential(*net)
-        
-        net= [nn.Linear(input_size, nhidden), nn.ReLU()]
-        for _ in range(1):
-            net.extend([nn.Linear(nhidden, nhidden), nn.ReLU()])
-        net.extend([nn.Linear(nhidden, output_size), nn.Softplus()])
-        self.lin_var= nn.Sequential(*net)
-        
-    def forward(self, x):
-        # out= self.lin1(x)
-        
-        mean= self.lin_mean(x).unsqueeze(1)
-        var= self.lin_var(x).unsqueeze(1) + self.epsilon
-        
-        return cat([mean, var], dim=1).view(x.shape[0], self.out_size * 2)
-
 
 class TEncoder(nn.Module):
     def __init__(self, input_size, nhidden, nhead=16, layers=2):
@@ -157,9 +126,11 @@ class TEncoder(nn.Module):
         
         self.model = nn.TransformerEncoder(encoder_layer, num_layers=layers)
         
-        self.in_linear= nn.Sequential(nn.Linear(input_size, nhidden), 
-                                      nn.ReLU(),
-                                      nn.Linear(nhidden, nhidden))
+        net= [nn.Linear(input_size, nhidden), nn.LeakyReLU(0.1)]
+        for _ in range(1):
+            net.extend([nn.Linear(nhidden, nhidden), nn.LeakyReLU(0.1), nn.Dropout(0.1)])
+        net.extend([nn.Linear(nhidden, nhidden)])
+        self.in_linear= nn.Sequential(*net)
         
         
     def forward(self, x, mask):
@@ -170,7 +141,7 @@ class TEncoder(nn.Module):
 
 @doubleq
 class RnnQnet(nn.Module):
-    def __init__(self, nclasses, enc_size, seq_len, nhidden, layers, in_cat= None, padval= -2, lin_layers= 2):
+    def __init__(self, nclasses, enc_size, seq_len, nhidden, layers, in_cat= None, padval= -2, lin_layers= 2, nmixes= 4):
         super().__init__()
         
         self.layers= layers
@@ -180,6 +151,7 @@ class RnnQnet(nn.Module):
         self.input_size= nclasses + 2
         self.padval= padval
         self.seqlen= seq_len
+        self.flatmix_shape= nmixes * 3
         
         self.in_cat= in_cat
         
@@ -197,11 +169,7 @@ class RnnQnet(nn.Module):
             batch_first=True
         )
         
-        # net= [nn.Linear(nhidden, nhidden), nn.LeakyReLU(0.2)]
-        # for _ in range(1):
-        #     net.extend([nn.Linear(nhidden, nhidden), nn.LeakyReLU(0.2)])
-        # net.extend([nn.Linear(nhidden, nhidden), ProbLinear(nhidden, nhidden, 1)])
-        self.emb= ProbLinear(nhidden + nhidden, nhidden, 1)
+        self.emb= mdn.MdnLinear(nhidden + nhidden, nhidden, nmixes)
         
     def inf(self, x, fpts, T, rewarder, explorer):
         explorer.epsilon= 0
@@ -212,63 +180,69 @@ class RnnQnet(nn.Module):
         cl_mask= get_class_mask(x[:,:,:n_classes])
         mask= get_mask(T, max_T= seq_len).unsqueeze(-1).tile([1,1,n_classes]) * cl_mask
         with torch.no_grad():
-            a, r= model.policy(x,fpts,rewarder.reward, explorer.explore, mask)
+            a, r= model.policy(x,fpts,rewarder.reward, explorer.explore, mask, nsacks= 1, sacks_indep= True)
             a= a.long()
+            print(r)
+            print((r < 0).any(dim=-1).count_nonzero())
+        r_out= torch.gather(fpts.squeeze(-1), 1, a.flatten(1)).view(a.shape)
         
-        return r[:,-1]
+        return r_out, a
         
-    def forward(self, x,y,r_fn, e_fn , mask, device= 'cuda', actions= None):
+    def forward(self, x,y,r_fn, e_fn , mask, device= 'cuda', actions= None, nsacks= 1, sacks_indep= True):
         x= x.to(device)
         bs= x.shape[0]
         ind= torch.Tensor(range(self.seqlen))
-        hidden= torch.zeros([self.layers, bs, self.nhidden]).to(device)
         if actions is None:
             inf= True
-            actions= self.padval * torch.ones([bs, self.nclasses]).long()
-            rewards= self.padval * torch.ones([bs, self.nclasses])
+            actions= self.padval * torch.ones([bs,nsacks,self.nclasses]).long()
+            rewards= self.padval * torch.ones([bs,nsacks,self.nclasses])
         
         else:
             inf= False
-            Q_a= self.padval * torch.ones([bs, self.nclasses, 2]).to(device)
-            Q_amax= self.padval * torch.ones([bs, self.nclasses, 1]).to(device)
+            Q_a= self.padval * torch.ones([bs, nsacks,self.nclasses, self.flatmix_shape]).to(device)
+            Q_amax= self.padval * torch.ones([bs, nsacks, self.nclasses, 1]).to(device)
         
-        sel_mask= torch.ones([bs, self.seqlen]).bool()
-        for p in range(self.nclasses):
-            enc_mask= mask[:,:,p] * sel_mask
-            z= self.enc(x, enc_mask)
+        if not sacks_indep:
+            hidden= torch.zeros([self.layers, bs, self.nhidden]).to(device)
             
-            i= torch.cat([z, hidden[-1].unsqueeze(1).tile([1, x.shape[1], 1])], dim=-1)
-            Q= input_padded(i, self.emb, enc_mask)
-            
-            mem_i= torch.zeros([bs, self.nhidden]).to(device)
-            for n in range(bs):
-                bm= enc_mask[n]
-                binds= ind[bm]
-                if inf:
-                    a= actions[n, p]
-                    if len(binds) > 0:
-                        q= Q[n, bm]
-                        exp_bool, aexp= e_fn(binds, q)
-                        if exp_bool:
-                            a= aexp
-                        else:
-                            if self.training:
-                                q_sample= torch.distributions.Normal(q[:,0], q[:,1]).sample()
-                                a= int(binds[q_sample.argmax()])
+        for k in range(nsacks):
+            if sacks_indep:
+                hidden= torch.zeros([self.layers, bs, self.nhidden]).to(device)
+            sel_mask= torch.ones([bs, self.seqlen]).bool()
+            for p in range(self.nclasses):
+                enc_mask= mask[:,:,p] * sel_mask
+                z= self.enc(x, enc_mask)
+                
+                i= torch.cat([z, hidden[-1].unsqueeze(1).tile([1, x.shape[1], 1])], dim=-1)
+                Q= input_padded(i, self.emb, enc_mask)
+                
+                mem_i= torch.zeros([bs, self.nhidden]).to(device)
+                for n in range(bs):
+                    bm= enc_mask[n]
+                    binds= ind[bm]
+                    if inf:
+                        if len(binds) > 0:
+                            q= Q[n, bm]
+                            exp_bool, aexp= e_fn(binds, q)
+                            if exp_bool:
+                                a= aexp
                             else:
-                                a= int(binds[q[:,0].argmax()])
-                        sel_mask[n, a] = False
-                    actions[n, p] = a
-                else:
-                    a= actions[n, p]
-                    if a >= 0:
-                        sel_mask[n, a] = False
-                        amax= int(binds[Q[n, bm][:,0].argmax()])
-                        Q_a[n,p]= Q[n, a]
-                        Q_amax[n,p]= Q[n, amax][0]
-                        
-                mem_i[n] = z[n, a]
-            _, hidden = self.S_rnn(mem_i.unsqueeze(1), hidden)
+                                # q_sample= mdn.GaussianMix(q).sample()
+                                q_sample= mdn.GaussianMix(q).expectation()
+                                a= int(binds[q_sample.argmax()])
+                            sel_mask[n, a] = False
+                        actions[n,k,p] = a
+                    else:
+                        a= actions[n,k,p]
+                        if a >= 0:
+                            Q_a[n,k,p]= Q[n, a]
+                            Q_amax[n,k,p]= mdn.GaussianMix(Q[n,bm]).expectation().max()
+                            sel_mask[n, a] = False
+                            
+                    mem_i[n] = z[n, a]
+                    
+                hmask= actions[:,k,p] >= 0
+                _, hidden[:,hmask] = self.S_rnn(mem_i.unsqueeze(1)[hmask], hidden[:,hmask])
         
         if inf:
             for n in range(bs):
@@ -279,10 +253,19 @@ class RnnQnet(nn.Module):
         else:
             out_batch_mask= (actions >= 0).all(dim=-1)
             terminate= torch.zeros_like(actions).bool().to(device)
-            terminate[:,-1] = True
-            Q_amax[:,0:-1] = Q_amax[:,1:]
             
-            return Q_a, Q_amax, terminate, out_batch_mask
+            # terminate[:,-1,-1] = True
+            # Q_n= Q_amax.flatten(1)
+            # Q_n[:,0:-1] = Q_n[:,1:]
+            # Q_n= Q_n.view(Q_amax.shape)
+            
+            terminate[:,:,-1] = True
+            Q_n= Q_amax
+            Q_n[:,:,0:-1]= Q_n[:,:,1:]
+            
+            # mdn.GaussianMix(Q_a[0,0].unsqueeze(0)).plot_prob_dist()
+            
+            return Q_a, Q_n, terminate, out_batch_mask
         
 def qLoss(out, lf, gamma= 1):
     q_state= out[0]
@@ -290,19 +273,13 @@ def qLoss(out, lf, gamma= 1):
     reward= out[2]
     not_terminal= out[3]
     
-    q_mean= q_state[:,0].unsqueeze(-1)
-    q_var= q_state[:,1].unsqueeze(-1)
-    
-    # print(next_q)
-    
     target= reward + (gamma * next_q * not_terminal)
     
-    l= ((q_mean - target) ** 2) / (2 * q_var) + torch.log(q_var)# + NLL_CONST
+    mix= mdn.GaussianMix(q_state)
+    l = -mix.log_prob(target.detach()).mean()
     
-    # print(q_mean)
-    # print(reward)
-    return l.mean()
-    # return lf(q_mean, target)
+    # return lf(mix.mean[:,0].unsqueeze(1), target)
+    return l
 
 if __name__ == '__main__':
     n_classes= 5
@@ -312,23 +289,24 @@ if __name__ == '__main__':
     
     lf= nn.HuberLoss()
     # lf= nn.MSELoss()
-    buffer= datamanager.ReplayMemory(batch_size * 100)
+    buffer= datamanager.ReplayMemory(batch_size * 200)
     
     T= seq_len * torch.ones([batch_size]).long()
     in_cat= [n_classes, 1, 1]
     
-    loss_cat= [2, 1, 1, 1]
-    
     model= RnnQnet(n_classes, nhidden, seq_len, nhidden, 2, in_cat= in_cat).cuda()
     model.load_model()
     
-    explorer= strats.Explorer(n_classes, (0.02, 0.9), 0.999)
+    loss_cat= [model.policy.flatmix_shape, 1, 1, 1]
+    
+    explorer= strats.Explorer(n_classes, (0.05, 0.9), 0.999)
     rewarder= strats.Rewarder(batch_size, model.policy.in_cat)
     
     model_op= optim.Adam(model.policy.parameters(), lr=0.0001)
     
     try:
-        for _ in range(10000):
+        pass
+        for _ in range(50000):
             model_op.zero_grad()
             
             x,fpts= datamanager.data_gen(batch_size= batch_size, inst_size= seq_len, class_size= n_classes)
@@ -340,6 +318,7 @@ if __name__ == '__main__':
                 
             buffer.push(qpack(x, a, r))
             x_b, a_b, r_b= qunpack(buffer.sample(batch_size))
+            # print(r_b[0])
             
             cl_mask= get_class_mask(x_b[:,:,:n_classes])
             mask= get_mask(T, max_T= seq_len).unsqueeze(-1).tile([1,1,n_classes]) * cl_mask
@@ -348,7 +327,7 @@ if __name__ == '__main__':
             with torch.no_grad():
                 _, Qn, _, _= model.target(x_b, r_b,rewarder.reward, explorer.explore, mask, actions= a_b.long())
             qcat= decat(cat([Qs, Qn, r_b.cuda().unsqueeze(-1), ~terminate.unsqueeze(-1)], dim=-1)[out_mask].flatten(0,1), loss_cat)
-                
+            
             loss= qLoss(qcat, lf)
             print(float(loss), float(r_b.mean()), explorer.epsilon)
             loss.backward()
@@ -362,11 +341,17 @@ if __name__ == '__main__':
         
         cl, sal, proj= decat(x, in_cat)
         
-        r_out= model.policy.inf(x, fpts, T, rewarder, explorer)
+        r_out, a= model.policy.inf(x, fpts, T, rewarder, explorer)
+        r_max= r_out.sum(dim=-1).max(dim=1)[0]
         
+        scores= []
         for n in range(x.shape[0]):
             rand_rew= float(datamanager.sample_eval(cl[n], sal[n], fpts[n]))
-            print(f"MOD: {float(r_out[n])}, RAND: {rand_rew}")
+            print(f"MOD: {float(r_max[n])}, RAND: {rand_rew}")
+            scores.append(float(r_max[n]) / rand_rew)
+        
+        scores= np.array(scores)
+        print(scores.mean())
         
         
     
