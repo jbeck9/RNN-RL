@@ -63,9 +63,8 @@ class Rewarder():
         
         sal_good= (sal_tot < 1)
         sal_bad= (~sal_good)
-        if sal_bad.any():
-            r[:,-1]= -5
-        else:
-            r[:,-1] += 2*(r_sel.sum(dim=1)**5 / self.NORM)
+        r = r_sel
+        
+        r[sal_bad] = -3
         
         return r

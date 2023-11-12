@@ -10,7 +10,10 @@ import strats
 import math
 
 import numpy as np
-import mdn
+# import mdn
+import MDN.mdn as mdn
+
+import time
 
 cat= torch.cat
 
@@ -93,7 +96,7 @@ def doubleq(cls):
             
             self.target.load_state_dict(self.policy.state_dict())
             
-            self.tau = 0.002
+            self.tau = 0.003
             
         def target_copy(self):
             target_net_state_dict = self.target.state_dict()
@@ -115,27 +118,26 @@ def doubleq(cls):
 
 
 class TEncoder(nn.Module):
-    def __init__(self, input_size, nhidden, nhead=16, layers=2):
+    def __init__(self, input_size, nhidden, nhead=16, layers=2, drop_rate=0.0):
         super(TEncoder, self).__init__()
         
         self.layers= layers
         self.nhidden= nhidden
         self.layers= layers
         
-        encoder_layer = nn.TransformerEncoderLayer(d_model=nhidden, nhead=nhead, batch_first= True)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=nhidden, nhead=nhead, batch_first= True, dropout= drop_rate)
         
         self.model = nn.TransformerEncoder(encoder_layer, num_layers=layers)
         
         net= [nn.Linear(input_size, nhidden), nn.LeakyReLU(0.1)]
         for _ in range(1):
-            net.extend([nn.Linear(nhidden, nhidden), nn.LeakyReLU(0.1), nn.Dropout(0.1)])
+            net.extend([nn.Linear(nhidden, nhidden), nn.LeakyReLU(0.1), nn.Dropout(drop_rate)])
         net.extend([nn.Linear(nhidden, nhidden)])
         self.in_linear= nn.Sequential(*net)
         
         
     def forward(self, x, mask):
         device= get_device(x)
-        
         x= input_padded(x, self.in_linear, mask)
         return self.model(x, src_key_padding_mask= ~mask.to(device))
 
@@ -163,13 +165,13 @@ class RnnQnet(nn.Module):
         self.enc= TEncoder(self.input_size, enc_size)
         
         self.S_rnn = nn.GRU(
-            input_size= nhidden,
+            input_size= self.nhidden + self.input_size,
             hidden_size= nhidden, 
             num_layers=layers, 
             batch_first=True
         )
         
-        self.emb= mdn.MdnLinear(nhidden + nhidden, nhidden, nmixes)
+        self.emb= mdn.MdnLinear(nhidden + self.input_size + nhidden, nhidden, nmixes)
         
     def inf(self, x, fpts, T, rewarder, explorer):
         explorer.epsilon= 0
@@ -182,7 +184,7 @@ class RnnQnet(nn.Module):
         with torch.no_grad():
             a, r= model.policy(x,fpts,rewarder.reward, explorer.explore, mask, nsacks= 1, sacks_indep= True)
             a= a.long()
-            print(r)
+            # print(r)
             print((r < 0).any(dim=-1).count_nonzero())
         r_out= torch.gather(fpts.squeeze(-1), 1, a.flatten(1)).view(a.shape)
         
@@ -205,18 +207,24 @@ class RnnQnet(nn.Module):
         if not sacks_indep:
             hidden= torch.zeros([self.layers, bs, self.nhidden]).to(device)
             
+        z= self.enc(x, torch.ones([bs, x.shape[1]]).bool().to(device))
+            
         for k in range(nsacks):
             if sacks_indep:
                 hidden= torch.zeros([self.layers, bs, self.nhidden]).to(device)
             sel_mask= torch.ones([bs, self.seqlen]).bool()
             for p in range(self.nclasses):
                 enc_mask= mask[:,:,p] * sel_mask
-                z= self.enc(x, enc_mask)
+                # hidden_tiled= hidden.unsqueeze(2).tile([1, 1, x.shape[1], 1])
+                # i=  cat([z.flatten(0,1).unsqueeze(1), x.flatten(0,1).unsqueeze(1)], dim=-1)
+                # _, hidden_out= self.S_rnn(i, hidden_tiled.flatten(1,2))
+                # hidden_out= hidden_out.view(hidden_out.shape[0], bs, x.shape[1], hidden_out.shape[-1])
+                # Q= input_padded(hidden_out[-1], self.emb, enc_mask)
                 
-                i= torch.cat([z, hidden[-1].unsqueeze(1).tile([1, x.shape[1], 1])], dim=-1)
+                i= torch.cat([z,x,hidden[-1].unsqueeze(1).tile([1, x.shape[1], 1])], dim=-1)
                 Q= input_padded(i, self.emb, enc_mask)
                 
-                mem_i= torch.zeros([bs, self.nhidden]).to(device)
+                mem_i= torch.zeros([bs, self.nhidden + self.input_size]).to(device)
                 for n in range(bs):
                     bm= enc_mask[n]
                     binds= ind[bm]
@@ -225,11 +233,12 @@ class RnnQnet(nn.Module):
                             q= Q[n, bm]
                             exp_bool, aexp= e_fn(binds, q)
                             if exp_bool:
-                                a= aexp
+                                q_sample= mdn.GaussianMix(q)
+                                a= int(binds[q_sample.sample(1000).std(dim=1).argmax()])
+                                # a= aexp
                             else:
-                                # q_sample= mdn.GaussianMix(q).sample()
-                                q_sample= mdn.GaussianMix(q).expectation()
-                                a= int(binds[q_sample.argmax()])
+                                q_exp= mdn.GaussianMix(q).expectation()
+                                a= int(binds[q_exp.argmax()])
                             sel_mask[n, a] = False
                         actions[n,k,p] = a
                     else:
@@ -238,11 +247,10 @@ class RnnQnet(nn.Module):
                             Q_a[n,k,p]= Q[n, a]
                             Q_amax[n,k,p]= mdn.GaussianMix(Q[n,bm]).expectation().max()
                             sel_mask[n, a] = False
-                            
-                    mem_i[n] = z[n, a]
-                    
-                hmask= actions[:,k,p] >= 0
-                _, hidden[:,hmask] = self.S_rnn(mem_i.unsqueeze(1)[hmask], hidden[:,hmask])
+                    mem_i[n] = torch.cat([x[n,a], z[n, a]], dim=-1)
+                
+                if p < (self.nclasses - 1):
+                    _, hidden = self.S_rnn(mem_i.unsqueeze(1), hidden)
         
         if inf:
             for n in range(bs):
@@ -263,7 +271,7 @@ class RnnQnet(nn.Module):
             Q_n= Q_amax
             Q_n[:,:,0:-1]= Q_n[:,:,1:]
             
-            # mdn.GaussianMix(Q_a[0,0].unsqueeze(0)).plot_prob_dist()
+            # mdn.GaussianMix(Q_a[-1,0,-1].unsqueeze(0)).plot_prob_dist()
             
             return Q_a, Q_n, terminate, out_batch_mask
         
@@ -275,8 +283,20 @@ def qLoss(out, lf, gamma= 1):
     
     target= reward + (gamma * next_q * not_terminal)
     
+    s= mdn.GaussianMix(q_state[-1].unsqueeze(0))
+    # print(s.var)
+
+    # print(float(s.sample(10000).std()))
+    # s.plot_sample_dist(1000)
+    # if s.sample(500).std(dim=1).mean() > 1:
+    s.plot_prob_dist()
+    # input()
+    
+    # print(q_state[-1])
+    
     mix= mdn.GaussianMix(q_state)
-    l = -mix.log_prob(target.detach()).mean()
+    # l = -mix.log_prob(target.detach()).mean()
+    l= mix.loss(target.detach())
     
     # return lf(mix.mean[:,0].unsqueeze(1), target)
     return l
@@ -294,15 +314,17 @@ if __name__ == '__main__':
     T= seq_len * torch.ones([batch_size]).long()
     in_cat= [n_classes, 1, 1]
     
-    model= RnnQnet(n_classes, nhidden, seq_len, nhidden, 2, in_cat= in_cat).cuda()
+    model= RnnQnet(n_classes, nhidden, seq_len, nhidden, 1, in_cat= in_cat).cuda()
     model.load_model()
     
     loss_cat= [model.policy.flatmix_shape, 1, 1, 1]
     
-    explorer= strats.Explorer(n_classes, (0.05, 0.9), 0.999)
+    explorer= strats.Explorer(n_classes, (0.1, 0.2), 0.9993)
     rewarder= strats.Rewarder(batch_size, model.policy.in_cat)
     
     model_op= optim.Adam(model.policy.parameters(), lr=0.0001)
+    
+    # model.eval()
     
     try:
         pass
@@ -316,34 +338,48 @@ if __name__ == '__main__':
             with torch.no_grad():
                 a, r= model.policy(x,fpts,rewarder.reward, explorer.explore, mask)
                 
-            buffer.push(qpack(x, a, r))
-            x_b, a_b, r_b= qunpack(buffer.sample(batch_size))
+            x_b, a_b, r_b= qunpack(buffer.pushpop(qpack(x, a, r)))
             # print(r_b[0])
             
             cl_mask= get_class_mask(x_b[:,:,:n_classes])
             mask= get_mask(T, max_T= seq_len).unsqueeze(-1).tile([1,1,n_classes]) * cl_mask
+            cl, sal, proj= decat(x_b, in_cat)
             
             Qs, Qn, terminate, out_mask= model.policy(x_b, r_b,rewarder.reward, explorer.explore, mask, actions= a_b.long().cuda())
             with torch.no_grad():
                 _, Qn, _, _= model.target(x_b, r_b,rewarder.reward, explorer.explore, mask, actions= a_b.long())
             qcat= decat(cat([Qs, Qn, r_b.cuda().unsqueeze(-1), ~terminate.unsqueeze(-1)], dim=-1)[out_mask].flatten(0,1), loss_cat)
             
+            # print((r_b < 0).any(dim=-1).count_nonzero())
+            sals= torch.gather(sal.squeeze(-1), 1, a_b.flatten(1)).view(a_b.shape)
+            # ptots= torch.gather(proj.squeeze(-1), 1, a_b.flatten(1)).view(a_b.shape)
+            # print(ptots[-1])
+            # print(r_b[-1])
+            last_sum= sals[-1].sum()
+            # if (r_b[0] < 0).any():
+            #     time.sleep(5)
+            
+            # print(last_sum)
             loss= qLoss(qcat, lf)
-            print(float(loss), float(r_b.mean()), explorer.epsilon)
+            # input()
+            print(float(loss), explorer.epsilon)
             loss.backward()
             
             model_op.step()
             explorer.step()
             model.target_copy()
+    except Exception as e:
+        print(e)
     finally:
-        x,fpts= datamanager.data_gen(batch_size= batch_size, inst_size= seq_len, class_size= n_classes)
-        T= seq_len * torch.ones([batch_size]).long()
-        
-        cl, sal, proj= decat(x, in_cat)
-        
-        r_out, a= model.policy.inf(x, fpts, T, rewarder, explorer)
-        r_max= r_out.sum(dim=-1).max(dim=1)[0]
-        
+        for _ in range(100):
+            x,fpts= datamanager.data_gen(batch_size= batch_size, inst_size= seq_len, class_size= n_classes)
+            T= seq_len * torch.ones([batch_size]).long()
+            
+            cl, sal, proj= decat(x, in_cat)
+            
+            r_out, a= model.policy.inf(x, fpts, T, rewarder, explorer)
+            r_max= r_out.sum(dim=-1).max(dim=1)[0]
+            
         scores= []
         for n in range(x.shape[0]):
             rand_rew= float(datamanager.sample_eval(cl[n], sal[n], fpts[n]))

@@ -61,9 +61,17 @@ class ReplayMemory(object):
         self.memory = deque([], maxlen=capacity)
         self.cat_order= decat
 
-    def push(self, dat):
-        """Save a transition"""
-        self.memory.extend(dat)
+    def pushpop(self, dat):
+        mask= np.random.rand(len(dat)) > 0.5
+        out= []
+        
+        for n in range(len(mask)):
+            if mask[n]:
+                self.memory.append(dat[n])
+                out.append(random.sample(self.memory, 1)[0])
+            else:
+                out.append(dat[n])
+        return out
 
     def sample(self, batch_size):
         return random.sample(self.memory, batch_size)
@@ -84,7 +92,7 @@ def data_gen(batch_size=64, inst_size= 100, class_size= 5):
     
     proj= torch.rand([batch_size, inst_size, 1])
     
-    fpts= torch.normal(proj, 0.3)
+    fpts= torch.normal(proj, 0.1)
     
     fpts= norm(fpts)
     proj= norm(proj)
@@ -96,7 +104,7 @@ def data_gen(batch_size=64, inst_size= 100, class_size= 5):
     return x
 
 
-def sample_eval(x, sal, rew, nsamples= 30000):
+def sample_eval(x, sal, rew, nsamples= 50000):
     inds= np.array(list(range(len(x))))
     n_space= x.shape[-1]
     
