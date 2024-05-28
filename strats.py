@@ -57,14 +57,17 @@ class Rewarder():
         sal_sel= salaries[action].squeeze(-1)
         r_sel= y[action].squeeze(-1)
         
+        steps= torch.Tensor([0.2000, 0.40, 0.60, 0.80, 1.0000])
+        
         sal_tot= torch.zeros(sal_sel.shape)
         for n in range(sal_sel.shape[1]):
             sal_tot[:,n] = sal_sel[:,:n+1].sum(dim=-1)
         
         sal_good= (sal_tot < 1)
         sal_bad= (~sal_good)
-        r = r_sel
+        r = r_sel - 2*torch.nn.functional.relu(sal_tot - steps)
         
-        r[sal_bad] = -3
+        r[sal_bad] = -2
+        
         
         return r

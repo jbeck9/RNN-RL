@@ -96,7 +96,7 @@ def doubleq(cls):
             
             self.target.load_state_dict(self.policy.state_dict())
             
-            self.tau = 0.003
+            self.tau = 0.001
             
         def target_copy(self):
             target_net_state_dict = self.target.state_dict()
@@ -171,7 +171,7 @@ class RnnQnet(nn.Module):
             batch_first=True
         )
         
-        self.emb= mdn.MdnLinear(nhidden + self.input_size + nhidden, nhidden, nmixes)
+        self.emb= mdn.MdnLinear(nhidden + self.input_size + nhidden, nhidden, nmixes, layers= 3)
         
     def inf(self, x, fpts, T, rewarder, explorer):
         explorer.epsilon= 0
@@ -283,13 +283,13 @@ def qLoss(out, lf, gamma= 1):
     
     target= reward + (gamma * next_q * not_terminal)
     
-    s= mdn.GaussianMix(q_state[-1].unsqueeze(0))
+    s= mdn.GaussianMix(q_state[-5].unsqueeze(0))
     # print(s.var)
 
     # print(float(s.sample(10000).std()))
     # s.plot_sample_dist(1000)
     # if s.sample(500).std(dim=1).mean() > 1:
-    s.plot_prob_dist()
+    # s.plot_prob_dist()
     # input()
     
     # print(q_state[-1])
@@ -319,16 +319,16 @@ if __name__ == '__main__':
     
     loss_cat= [model.policy.flatmix_shape, 1, 1, 1]
     
-    explorer= strats.Explorer(n_classes, (0.1, 0.2), 0.9993)
+    explorer= strats.Explorer(n_classes, (0.15, 0.2), 0.998)
     rewarder= strats.Rewarder(batch_size, model.policy.in_cat)
     
-    model_op= optim.Adam(model.policy.parameters(), lr=0.0001)
+    model_op= optim.Adam(model.policy.parameters(), lr=0.0002)
     
     # model.eval()
     
     try:
         pass
-        for _ in range(50000):
+        for _ in range(10000):
             model_op.zero_grad()
             
             x,fpts= datamanager.data_gen(batch_size= batch_size, inst_size= seq_len, class_size= n_classes)
@@ -355,11 +355,11 @@ if __name__ == '__main__':
             # ptots= torch.gather(proj.squeeze(-1), 1, a_b.flatten(1)).view(a_b.shape)
             # print(ptots[-1])
             # print(r_b[-1])
-            last_sum= sals[-1].sum()
+            last_sum= sals[-1]
             # if (r_b[0] < 0).any():
             #     time.sleep(5)
             
-            # print(last_sum)
+            print(last_sum.sum())
             loss= qLoss(qcat, lf)
             # input()
             print(float(loss), explorer.epsilon)
