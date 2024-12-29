@@ -233,9 +233,16 @@ class RnnQnet(nn.Module):
                             q= Q[n, bm]
                             exp_bool, aexp= e_fn(binds, q)
                             if exp_bool:
-                                q_sample= mdn.GaussianMix(q)
-                                a= int(binds[q_sample.sample(1000).std(dim=1).argmax()])
-                                # a= aexp
+                                # q_sample= mdn.GaussianMix(q)
+                                # sam= q_sample.sample(1000)
+                                # a= int(binds[sam.argmax(dim=0)[int(torch.randint(0, 1000, (1,)))]])
+                                
+                                # sample_std= q_sample.sample(1000).std(dim=1)
+                                # print(sample_std.max())
+                                # a= int(binds[sample_std.argmax()])
+                                a= aexp
+                                
+                                # print(a)
                             else:
                                 q_exp= mdn.GaussianMix(q).expectation()
                                 a= int(binds[q_exp.argmax()])
@@ -359,7 +366,7 @@ if __name__ == '__main__':
             # if (r_b[0] < 0).any():
             #     time.sleep(5)
             
-            print(last_sum.sum())
+            # print(last_sum.sum())
             loss= qLoss(qcat, lf)
             # input()
             print(float(loss), explorer.epsilon)
